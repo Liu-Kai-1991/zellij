@@ -2960,7 +2960,7 @@ mod web_client_tests {
             "index.html must not carry a data-authenticated hint"
         );
         assert!(
-            body.contains("src=\"assets/app.js\""),
+            body.contains("src=\"assets/app.js?v="),
             "index.html must load the bundled app.js module"
         );
 
@@ -2987,6 +2987,7 @@ mod web_client_tests {
             };
             let asset = &line
                 [attribute_start..attribute_start + line[attribute_start..].find('"').unwrap()];
+            let asset = asset.split('?').next().unwrap();
             let Some(expected) = integrity.get(asset) else {
                 continue;
             };

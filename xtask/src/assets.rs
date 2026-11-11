@@ -324,6 +324,7 @@ fn rewrite_integrity_attributes(
                     asset
                 )
             })?;
+            rewritten = set_asset_version(&rewritten, &asset, digest);
         }
         out.push_str(&rewritten);
         out.push('\n');
@@ -338,13 +339,34 @@ fn rewrite_integrity_attributes(
 fn referenced_asset(line: &str, digests: &BTreeMap<String, String>) -> Option<String> {
     for asset in digests.keys() {
         for attribute in ["src=\"assets/", "href=\"assets/"] {
-            let needle = format!("{}{}\"", attribute, asset);
-            if line.contains(&needle) {
+            let plain = format!("{}{}\"", attribute, asset);
+            let versioned = format!("{}{}?v=", attribute, asset);
+            if line.contains(&plain) || line.contains(&versioned) {
                 return Some(asset.clone());
             }
         }
     }
     None
+}
+
+/// Point the asset URL at `assets/<asset>?v=<content hash>` so caches in
+/// front of the web server (e.g. a CDN) never pair a new index.html with a
+/// stale asset, which would fail the integrity check.
+fn set_asset_version(line: &str, asset: &str, digest: &str) -> String {
+    let version: String = digest
+        .trim_start_matches("sha384-")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect();
+    let prefix = format!("assets/{}", asset);
+    let Some(start) = line.find(&format!("\"{}", prefix)).map(|i| i + 1) else {
+        return line.to_string();
+    };
+    let Some(end) = line[start..].find('"').map(|i| start + i) else {
+        return line.to_string();
+    };
+    format!("{}{}?v={}{}", &line[..start], prefix, version, &line[end..])
 }
 
 fn replace_integrity_value(line: &str, digest: &str) -> Option<String> {
@@ -437,7 +459,14 @@ mod tests {
         let rewritten = rewrite_integrity_attributes(source, &digests).expect("rewrite");
         assert_eq!(
             rewritten,
-            "<script type=\"module\" src=\"assets/app.js\" integrity=\"sha384-abc\"></script>\n"
+            "<script type=\"module\" src=\"assets/app.js?v=abc\" integrity=\"sha384-abc\"></script>\n"
+        );
+        // already-versioned URLs get their version replaced
+        digests.insert("app.js".to_string(), "sha384-x/y+z".to_string());
+        let again = rewrite_integrity_attributes(&rewritten, &digests).expect("rewrite");
+        assert_eq!(
+            again,
+            "<script type=\"module\" src=\"assets/app.js?v=xyz\" integrity=\"sha384-x/y+z\"></script>\n"
         );
     }
 

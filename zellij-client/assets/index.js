@@ -1,4 +1,4 @@
-import { initConnectionHandlers } from './connection.js';
+import { initConnectionHandlers, setReconnectHandler } from './connection.js';
 import { fetchSession, fetchSessionList } from './auth.js';
 import { initTerminal, settleFontSize } from './terminal.js';
 import { setupInputHandlers } from './input.js';
@@ -42,5 +42,28 @@ document.addEventListener("DOMContentLoaded", async (event) => {
     document.title = boot.session_name;
     websockets = initWebSockets(boot, term, fitAddon);
 
-    setupInputHandlers(term, fitAddon, websockets.sendAnsiKey);
+    // Reconnect in place (fresh session handshake + new websockets on the
+    // same terminal) instead of reloading the page, which makes the screen blink
+    setReconnectHandler(async () => {
+        // Rejoin the session in the URL, like a reload would: it follows
+        // SwitchedSession, whereas boot.session_name is the session this page
+        // first opened (e.g. the welcome session)
+        let currentSession = boot.session_name;
+        try {
+            currentSession =
+                decodeURIComponent(location.pathname.split("/").pop()) || boot.session_name;
+        } catch (e) {
+            // malformed URL: keep the boot session
+        }
+        const freshBoot = await fetchSession(currentSession, { welcome: false });
+        if (!freshBoot || !freshBoot.web_client_id) {
+            throw new Error("no web client id in session response");
+        }
+        websockets.cleanup();
+        websockets = initWebSockets(freshBoot, term, fitAddon, {
+            clearOnFirstMessage: true,
+        });
+    });
+
+    setupInputHandlers(term, fitAddon, (data) => websockets.sendAnsiKey(data));
 });

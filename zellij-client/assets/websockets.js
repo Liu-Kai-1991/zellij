@@ -11,6 +11,10 @@ import {
 } from "./terminal.js";
 
 let lastSentCellDimensions = null;
+// The live sockets; replaced in place when reconnecting
+let currentWsControl = null;
+let currentWebClientId = null;
+let resizeHandlerInstalled = false;
 
 function getCellPixelDimensions(term) {
     try {
@@ -82,7 +86,7 @@ function sendSizeUpdate(wsControl, ownWebClientId, term, rows, cols) {
     );
 }
 
-export function initWebSockets(boot, term, fitAddon) {
+export function initWebSockets(boot, term, fitAddon, options = {}) {
     const ownWebClientId = boot.web_client_id;
     const sessionName = boot.session_name;
     let wsTerminal;
@@ -128,6 +132,8 @@ export function initWebSockets(boot, term, fitAddon) {
     wsControl = new WebSocket(
         `${wsBaseUrl}/ws/control?web_client_id=${encodeURIComponent(ownWebClientId)}`
     );
+    currentWsControl = wsControl;
+    currentWebClientId = ownWebClientId;
     startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig);
     window.__zjSendControl = function (payload) {
         if (wsControl && wsControl.readyState === WebSocket.OPEN) {
@@ -143,6 +149,10 @@ export function initWebSockets(boot, term, fitAddon) {
     wsTerminal.onopen = function () {
         markConnectionEstablished();
     };
+
+    // When reconnecting, the old (frozen) screen is still shown: clear it in
+    // the same write as the server's first redraw so there is no blank frame
+    let clearBeforeNextWrite = !!options.clearOnFirstMessage;
 
     wsTerminal.onmessage = function (event) {
         let data = event.data;
@@ -188,6 +198,10 @@ export function initWebSockets(boot, term, fitAddon) {
             }
         }
 
+        if (clearBeforeNextWrite) {
+            clearBeforeNextWrite = false;
+            term.write("\x1b[0m\x1b[H\x1b[2J");
+        }
         term.write(data);
     };
 
@@ -195,7 +209,7 @@ export function initWebSockets(boot, term, fitAddon) {
         if (event.code === 4001) {
             handleDisconnected();
         } else {
-            handleReconnection();
+            handleReconnection(term);
         }
     };
 
@@ -204,15 +218,20 @@ export function initWebSockets(boot, term, fitAddon) {
         if (typeof window.__zjMobileMergeKey === "function") {
             payload = window.__zjMobileMergeKey(payload);
         }
-        wsTerminal.send(payload);
+        if (wsTerminal.readyState === WebSocket.OPEN) {
+            wsTerminal.send(payload);
+        }
     };
 
-    setupResizeHandler(
-        term,
-        fitAddon,
-        () => wsControl,
-        () => ownWebClientId
-    );
+    if (!resizeHandlerInstalled) {
+        resizeHandlerInstalled = true;
+        setupResizeHandler(
+            term,
+            fitAddon,
+            () => currentWsControl,
+            () => currentWebClientId
+        );
+    }
 
     return {
         wsTerminal,
@@ -220,10 +239,15 @@ export function initWebSockets(boot, term, fitAddon) {
         getOwnWebClientId: () => ownWebClientId,
         sendAnsiKey,
         cleanup: () => {
+            // detach first so closing these doesn't start another reconnect
             if (wsTerminal) {
+                wsTerminal.onclose = null;
+                wsTerminal.onmessage = null;
                 wsTerminal.close();
             }
             if (wsControl) {
+                wsControl.onclose = null;
+                wsControl.onmessage = null;
                 wsControl.close();
             }
         },
@@ -305,7 +329,7 @@ function startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig) {
         if (event.code === 4001) {
             handleDisconnected();
         } else {
-            handleReconnection();
+            handleReconnection(term);
         }
     };
 }
