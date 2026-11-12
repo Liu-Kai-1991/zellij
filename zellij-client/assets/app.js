@@ -3155,6 +3155,17 @@ let lastSentCellDimensions = null;
 let currentWsControl = null;
 let currentWebClientId = null;
 let resizeHandlerInstalled = false;
+// The pane (and so tab) this browser was on, from the server's MobileState
+// pushes; used to return to the same tab after reconnecting
+let lastActivePane = null;
+
+/**
+ * The pane this browser had focused before the connection dropped
+ * @returns {{pane_id: number, is_plugin: boolean, tab_position: number, session_name: string}|null}
+ */
+function getLastActivePane() {
+    return lastActivePane;
+}
 
 function getCellPixelDimensions(term) {
     try {
@@ -3274,7 +3285,9 @@ function initWebSockets(boot, term, fitAddon, options = {}) {
     );
     currentWsControl = wsControl;
     currentWebClientId = ownWebClientId;
-    startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig);
+    startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig, (payload) =>
+        onMobileState(payload)
+    );
     window.__zjSendControl = function (payload) {
         if (wsControl && wsControl.readyState === WebSocket.OPEN) {
             wsControl.send(
@@ -3293,6 +3306,56 @@ function initWebSockets(boot, term, fitAddon, options = {}) {
     // When reconnecting, the old (frozen) screen is still shown: clear it in
     // the same write as the server's first redraw so there is no blank frame
     let clearBeforeNextWrite = !!options.clearOnFirstMessage;
+
+    // A new web client always attaches on the first tab. To return to the
+    // tab we were on, hold the screen output, ask the server to focus the
+    // previous pane, and draw everything in one go once it's active (or
+    // after a timeout), so the first tab never flashes up.
+    const restorePane = options.restorePane || null;
+    let holding = !!(clearBeforeNextWrite && restorePane);
+    let held = [];
+    let focusRequested = false;
+    const releaseHeldOutput = () => {
+        if (!holding) {
+            return;
+        }
+        holding = false;
+        clearTimeout(holdTimer);
+        clearBeforeNextWrite = false;
+        term.write("\x1b[0m\x1b[H\x1b[2J");
+        for (const chunk of held) {
+            term.write(chunk);
+        }
+        held = [];
+    };
+    const holdTimer = holding ? setTimeout(releaseHeldOutput, 1500) : null;
+    const samePane = (a, b) =>
+        !!a && !!b && a.pane_id === b.pane_id && !!a.is_plugin === !!b.is_plugin;
+
+    const onMobileState = (payload) => {
+        const active = payload.active_pane || null;
+        if (holding) {
+            const stillExists = (payload.panes || []).some((p) => samePane(p, restorePane));
+            if (samePane(active, restorePane) || !stillExists) {
+                releaseHeldOutput();
+            } else if (!focusRequested && wsControl.readyState === WebSocket.OPEN) {
+                focusRequested = true;
+                wsControl.send(
+                    JSON.stringify({
+                        web_client_id: ownWebClientId,
+                        payload: {
+                            type: "FocusPane",
+                            pane_id: restorePane.pane_id,
+                            is_plugin: !!restorePane.is_plugin,
+                        },
+                    })
+                );
+            }
+        }
+        if (!holding && active) {
+            lastActivePane = { ...active, session_name: payload.session_name };
+        }
+    };
 
     wsTerminal.onmessage = function (event) {
         let data = event.data;
@@ -3338,6 +3401,10 @@ function initWebSockets(boot, term, fitAddon, options = {}) {
             }
         }
 
+        if (holding) {
+            held.push(data);
+            return;
+        }
         if (clearBeforeNextWrite) {
             clearBeforeNextWrite = false;
             term.write("\x1b[0m\x1b[H\x1b[2J");
@@ -3394,7 +3461,7 @@ function initWebSockets(boot, term, fitAddon, options = {}) {
     };
 }
 
-function startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig) {
+function startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig, onMobileState) {
     wsControl.onmessage = function (event) {
         const msg = JSON.parse(event.data);
         if (msg.type === "SetConfig") {
@@ -3457,6 +3524,7 @@ function startWsControl(wsControl, term, fitAddon, ownWebClientId, userConfig) {
         } else if (msg.type === "MobileState") {
             const { payload } = msg;
             if (payload) {
+                onMobileState(payload);
                 window.__zjLastMobileState = payload;
                 if (window.__zjMobileUi) {
                     window.__zjMobileUi.setData(payload);
@@ -3666,8 +3734,13 @@ document.addEventListener("DOMContentLoaded", async (event) => {
             throw new Error("no web client id in session response");
         }
         websockets.cleanup();
+        // Only restore the pane when rejoining the same session
+        const lastPane = getLastActivePane();
+        const restorePane =
+            lastPane && lastPane.session_name === currentSession ? lastPane : null;
         websockets = initWebSockets(freshBoot, term, fitAddon, {
             clearOnFirstMessage: true,
+            restorePane,
         });
     });
 

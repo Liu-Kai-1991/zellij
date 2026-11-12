@@ -2,7 +2,7 @@ import { initConnectionHandlers, setReconnectHandler } from './connection.js';
 import { fetchSession, fetchSessionList } from './auth.js';
 import { initTerminal, settleFontSize } from './terminal.js';
 import { setupInputHandlers } from './input.js';
-import { initWebSockets } from './websockets.js';
+import { initWebSockets, getLastActivePane } from './websockets.js';
 import {
     initMobileUi,
     shouldUseStandaloneMenu,
@@ -60,8 +60,13 @@ document.addEventListener("DOMContentLoaded", async (event) => {
             throw new Error("no web client id in session response");
         }
         websockets.cleanup();
+        // Only restore the pane when rejoining the same session
+        const lastPane = getLastActivePane();
+        const restorePane =
+            lastPane && lastPane.session_name === currentSession ? lastPane : null;
         websockets = initWebSockets(freshBoot, term, fitAddon, {
             clearOnFirstMessage: true,
+            restorePane,
         });
     });
 
